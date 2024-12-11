@@ -8,17 +8,6 @@ from torch import nn
 from modelling.attention import MultiHeadAttention
 
 
-# Define softmax function using numpy for compatibility
-def softmax(x):
-    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
-
-
-# Linear transformation
-def linear(x, w, b):
-    return x @ w + b
-
-
 # Attention class
 class Attention:
     def __init__(self, mask_future=True):
@@ -71,7 +60,7 @@ class Attention:
 
 
 class BaseTransformerLayer(nn.Module):
-    def __init__(self, input_dim=512, num_heads=8, feature_dim=2048, dropout=0.1, mask_future=True):
+    def __init__(self, input_dim=512, num_heads=8, feature_dim=2048, dropout=0.1, mask_future=False):
         """
         Base Transformer Layer with Multi-Head Attention and Position-Wise Feed-Forward Network.
 
@@ -113,172 +102,63 @@ class BaseTransformerLayer(nn.Module):
         Returns:
         - torch.Tensor: Output tensor after applying multi-head attention and feed-forward network.
         """
+
         # Multi-head attention with optional mask
         attn_output = self.self_attention(x, x, x, mask)
-        # Residual connection, dropout, and layer normalization
-        x = self.layer_norm_1(x + self.dropout1(attn_output))
 
-        # Position-wise feed-forward network with residual connection
+        # Residual connection, dropout, and layer normalization
+        x_residual_1 = x + self.dropout1(attn_output)
+
+        x = self.layer_norm_1(x_residual_1)
+
+        # Position-wise feed-forward network
         ffn_output = self.feature_transformation(x)
 
-        # Dropout and second layer normalization
-        x = self.layer_norm_2(x + self.dropout2(ffn_output))
+        # Residual connection, dropout, and second layer normalization
+        x_residual_2 = x + self.dropout2(ffn_output)
+
+        x = self.layer_norm_2(x_residual_2)
 
         return x
 
 
-# Example function for causal self-attention
-def causal_self_attention(x, c_attn, c_proj):
-    # Linear projection to get q, k, v
-    x = linear(x, **c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
-    q, k, v = np.split(x, 3, axis=-1)  # [n_seq, 3*n_embd] -> 3 of [n_seq, n_embd]
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, input_dim=512, num_heads=8, feature_dim=2048, dropout=0.1):
+        super(TransformerDecoderLayer, self).__init__()
 
-    # Initialize the Attention class with causal masking enabled
-    attention_layer = Attention(mask_future=True)
+        # Self-attention (with future masking)
+        self.self_attention = MultiHeadAttention(input_dim, num_heads, mask_future=True)
 
-    # Perform causal self-attention
-    x = attention_layer(q, k, v)  # [n_seq, n_embd]
+        # Cross-attention (encoder-decoder attention)
+        self.encoder_attention = MultiHeadAttention(input_dim, num_heads, mask_future=False)
 
-    # Output projection
-    x = linear(x, **c_proj)  # [n_seq, n_embd] -> [n_seq, n_embd]
-    return x
+        # Feed-forward network with two linear transformations
+        self.feature_transformation = nn.Sequential(OrderedDict([
+            ('linear1', nn.Linear(input_dim, feature_dim)),
+            ('relu', nn.ReLU()),
+            ('linear2', nn.Linear(feature_dim, input_dim))
+        ]))
 
+        # Layer normalization layers
+        self.layer_norm_1 = nn.LayerNorm(input_dim)
+        self.layer_norm_2 = nn.LayerNorm(input_dim)
+        self.layer_norm_3 = nn.LayerNorm(input_dim)
 
-# [n_seq, n_embd] -> [n_seq, n_embd]
-def transformer_block(x, attn):
-    x = x + causal_self_attention(x, **attn)
-    # NOTE: removed ffn
-    return x
+        # Dropout layers
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
 
+    def forward(self, x, encoder_output, self_attn_mask=None, cross_attn_mask=None):
+        # Self-attention with future masking
+        self_attn_output = self.self_attention(x, x, x, mask=cross_attn_mask)
+        x = self.layer_norm_1(x + self.dropout1(self_attn_output))
+        # Cross-attention with encoder output
+        cross_attn_output = self.encoder_attention(x, encoder_output, encoder_output, mask=self_attn_mask)
+        x = self.layer_norm_2(x + self.dropout2(cross_attn_output))
 
-# [n_seq] -> [n_seq, n_vocab]
-def gpt(inputs, wte, wpe, blocks):
-    # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
+        # Feed-forward network
+        ffn_output = self.feature_transformation(x)
+        x = self.layer_norm_3(x + self.dropout3(ffn_output))
 
-    # forward pass through n_layer transformer blocks
-    for block in blocks:
-        x = transformer_block(x, **block)  # [n_seq, n_embd] -> [n_seq, n_embd]
-
-    # projection to vocab
-    return x @ wte.T  # [n_seq, n_embd] -> [n_seq, n_vocab]
-
-
-N_CTX = 5
-N_VOCAB = 2
-N_EMBED = 8
-
-Lg = 1024  # Large
-
-MODEL = {
-    # EMBEDDING USAGE
-    #  P = Position embeddings (one-hot)
-    #  T = Token embeddings (one-hot, first is `a`, second is `b`)
-    #  V = Prediction scratch space
-    #
-    #       [P, P, P, P, P, T, T, V]
-    "wte": np.array(
-        # one-hot token embeddings
-        [
-            [0, 0, 0, 0, 0, 1, 0, 0],  # token `a` (id 0)
-            [0, 0, 0, 0, 0, 0, 1, 0],  # token `b` (id 1)
-        ]
-    ),
-    "wpe": np.array(
-        # one-hot position embeddings
-        [
-            [1, 0, 0, 0, 0, 0, 0, 0],  # position 0
-            [0, 1, 0, 0, 0, 0, 0, 0],  # position 1
-            [0, 0, 1, 0, 0, 0, 0, 0],  # position 2
-            [0, 0, 0, 1, 0, 0, 0, 0],  # position 3
-            [0, 0, 0, 0, 1, 0, 0, 0],  # position 4
-        ]
-    ),
-    "blocks": [
-        {
-            "attn": {
-                "c_attn": {  # generates qkv matrix
-                    "b": np.zeros(N_EMBED * 3),
-                    "w": np.array(
-                        # this is where the magic happens
-                        # fmt: off
-                        [
-                            [Lg, 0., 0., 0., 0., 0., 0., 0.,  # q
-                             1., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [Lg, Lg, 0., 0., 0., 0., 0., 0.,  # q
-                             0., 1., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., Lg, Lg, 0., 0., 0., 0., 0.,  # q
-                             0., 0., 1., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., 0., Lg, Lg, 0., 0., 0., 0.,  # q
-                             0., 0., 0., 1., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., 0., 0., Lg, Lg, 0., 0., 0.,  # q
-                             0., 0., 0., 0., 1., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., 0., 0., 0., 0., 0., 0., 0.,  # q
-                             0., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 1.],  # v
-                            [0., 0., 0., 0., 0., 0., 0., 0.,  # q
-                             0., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., -1],  # v
-                            [0., 0., 0., 0., 0., 0., 0., 0.,  # q
-                             0., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                        ]
-                        # fmt: on
-                    ),
-                },
-                "c_proj": {  # weights to project attn result back to embedding space
-                    "b": [0, 0, 0, 0, 0, Lg, 0, 0],
-                    "w": np.array(
-                        [
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, -Lg, Lg, 0],
-                        ]
-                    ),
-                },
-            },
-        }
-    ],
-}
-
-CHARS = ["a", "b"]
-
-
-def tokenize(s): return [CHARS.index(c) for c in s]
-
-
-def untok(tok): return CHARS[tok]
-
-
-def predict(s):
-    tokens = tokenize(s)[-5:]
-    logits = gpt(np.array(tokens), **MODEL)
-    probs = softmax(logits)
-
-    for i, tok in enumerate(tokens):
-        pred = np.argmax(probs[i])
-        print(
-            f"{untok(tok)} ({tok}): next={untok(pred)} ({pred}) probs={probs[i]} logits={logits[i]}"
-        )
-
-    return np.argmax(probs[-1])
-
-
-def complete(s, max_new_tokens=10):
-    tokens = tokenize(s)
-    while len(tokens) < len(s) + max_new_tokens:
-        logits = gpt(np.array(tokens[-5:]), **MODEL)
-        probs = softmax(logits)
-        pred = np.argmax(probs[-1])
-        tokens.append(pred)
-    return s + " :: " + "".join(untok(t) for t in tokens[len(s):])
+        return x

@@ -1,5 +1,7 @@
 import re
+from datasets import load_dataset
 
+ds = load_dataset("wmt/wmt17", "de-en")
 
 def clean_sentence(sentence):
     # Remove non-UTF8 characters

@@ -80,7 +80,7 @@ class MultiHeadAttention(nn.Module):
         Args:
         - d_model (int): The dimensionality of the model (input and output dimension).
         - num_heads (int): The number of attention heads.
-        - mask_future (bool): Whether to apply causal masking to hide future tokens (default is True).
+        - mask_future (bool): Whether to apply causal masking to hide future tokens.
         """
         super(MultiHeadAttention, self).__init__()
         self.num_heads = num_heads
@@ -127,13 +127,13 @@ class MultiHeadAttention(nn.Module):
         Apply the multi-head attention mechanism.
 
         Args:
-        - q (torch.Tensor): Query matrix [batch_size, seq_len, d_model]
-        - k (torch.Tensor): Key matrix [batch_size, seq_len, d_model]
-        - v (torch.Tensor): Value matrix [batch_size, seq_len, d_model]
-        - mask (torch.Tensor, optional): Attention mask [batch_size, seq_len] or [batch_size, 1, 1, seq_len]
+        - q (torch.Tensor): Query matrix [batch_size, query_len, d_model]
+        - k (torch.Tensor): Key matrix [batch_size, key_len, d_model]
+        - v (torch.Tensor): Value matrix [batch_size, key_len, d_model]
+        - mask (torch.Tensor, optional): Attention mask [batch_size, query_len, key_len]
 
         Returns:
-        - torch.Tensor: Multi-head attention output [batch_size, seq_len, d_model]
+        - torch.Tensor: Multi-head attention output [batch_size, query_len, d_model]
         """
         batch_size = q.size(0)
 
@@ -143,32 +143,34 @@ class MultiHeadAttention(nn.Module):
         v = self.value_transform(v)
 
         # Split into multiple heads
-        q = self.split_heads(q, batch_size)  # [batch_size, num_heads, seq_len, d_k]
-        k = self.split_heads(k, batch_size)
-        v = self.split_heads(v, batch_size)
+        q = self.split_heads(q, batch_size)  # [batch_size, num_heads, query_len, d_k]
+        k = self.split_heads(k, batch_size)  # [batch_size, num_heads, key_len, d_k]
+        v = self.split_heads(v, batch_size)  # [batch_size, num_heads, key_len, d_k]
 
         # Scaled dot-product attention
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [batch_size, num_heads, query_len, key_len]
 
-        # Apply future (causal) mask if specified
-        if self.mask_future:
+        # Apply future (causal) mask if specified and if q and k have the same sequence length (self-attention)
+        if self.mask_future and q.size(-2) == k.size(-2):
             seq_len = attn_scores.size(-1)
             causal_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).to(attn_scores.device)
             attn_scores = attn_scores.masked_fill(causal_mask == 1, float('-inf'))
 
         # Apply provided mask if available
         if mask is not None:
-            if mask.dim() == 2:  # Mask is [batch_size, seq_len]
-                mask = mask.unsqueeze(1).unsqueeze(2)  # Reshape to [batch_size, 1, 1, seq_len] for broadcasting
+            if mask.dim() == 2:  # Mask is [batch_size, key_len] (for encoder-decoder cross-attention)
+                mask = mask.unsqueeze(1).unsqueeze(1)  # Reshape to [batch_size, 1, 1, key_len]
+            elif mask.dim() == 3:  # Mask is [batch_size, query_len, key_len]
+                mask = mask.unsqueeze(1)  # Reshape to [batch_size, 1, query_len, key_len]
             attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
 
         # Apply softmax to get attention weights
         attn_weights = F.softmax(attn_scores, dim=-1)
 
         # Compute output by weighted sum of values
-        output = torch.matmul(attn_weights, v)  # [batch_size, num_heads, seq_len, d_k]
+        output = torch.matmul(attn_weights, v)  # [batch_size, num_heads, query_len, d_k]
 
-        # Concatenate heads and reshape back to [batch_size, seq_len, d_model]
+        # Concatenate heads and reshape back to [batch_size, query_len, d_model]
         output = self.combine_heads(output, batch_size)
 
         # Final linear transformation
