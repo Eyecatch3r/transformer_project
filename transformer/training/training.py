@@ -125,26 +125,51 @@ def test_AdamW():
     print(optimizer)
 
 
+def preprocess_split_and_collate(dataset, tokenizer):
+    def preprocess(examples):
+        # Handle 'translation' as a list of dictionaries
+        translations = examples.get("translation", [])
+        inputs = [entry["de"] for entry in translations if "de" in entry]
+        targets = [entry["en"] for entry in translations if "en" in entry]
+
+        # Tokenize inputs and targets
+        tokenized_inputs = tokenizer(
+            inputs, max_length=128, truncation=True, padding="max_length", return_tensors="pt"
+        )
+        tokenized_targets = tokenizer(
+            targets, max_length=128, truncation=True, padding="max_length", return_tensors="pt"
+        )
+
+        return {
+            "input_ids": tokenized_inputs["input_ids"],
+            "attention_mask": tokenized_inputs["attention_mask"],
+            "labels": tokenized_targets["input_ids"],
+        }
+
+    # Reduce dataset size for faster testing
+    small_train = dataset["train"].shuffle(seed=42).select(range(3000))
+    small_val = dataset["validation"].shuffle(seed=42).select(range(2999))
+
+    # Apply preprocessing
+    small_train = small_train.map(preprocess, batched=True, remove_columns=["translation"] )
+    small_val = small_val.map(preprocess, batched=True, remove_columns=["translation"] )
+
+    # Data collator
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=None)
+
+    # Data loaders
+    train_dataloader = DataLoader(small_train, batch_size=16, collate_fn=data_collator)
+    val_dataloader = DataLoader(small_val, batch_size=16, collate_fn=data_collator)
+    return train_dataloader, val_dataloader
+
+
 def train():
     # Load dataset
     dataset = load_dataset("wmt/wmt17", "de-en")
     tokenizer = AutoTokenizer.from_pretrained("t5-small")
-
-    def preprocess(examples):
-        inputs = examples['translation']['de']
-        targets = examples['translation']['en']
-        inputs = tokenizer(inputs, max_length=128, truncation=True, padding="max_length", return_tensors="pt")
-        targets = tokenizer(targets, max_length=128, truncation=True, padding="max_length", return_tensors="pt")
-        return {"input_ids": inputs.input_ids, "attention_mask": inputs.attention_mask, "labels": targets.input_ids}
-
-    dataset = dataset.map(preprocess, batched=True)
-    small_train = dataset["train"].shuffle(seed=42).select(range(1000))
-    small_val = dataset["validation"].shuffle(seed=42).select(range(200))
-
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=None)
-
-    train_dataloader = DataLoader(small_train, batch_size=16, collate_fn=data_collator)
-    val_dataloader = DataLoader(small_val, batch_size=16, collate_fn=data_collator)
+    assert torch.cuda.is_available()
+    # Preprocess and split dataset
+    train_dataloader, val_dataloader = preprocess_split_and_collate(dataset, tokenizer)
 
     # Model, optimizer, scheduler
     model = TransformerModel(
@@ -154,10 +179,10 @@ def train():
         num_encoder_layers=4,
         num_decoder_layers=4,
         dim_feedforward=128,
-        dropout=0.1,
+        dropout=0.3,
         max_len=128,
     )
-    optimizer = get_optimizer(model, learning_rate=1e-4, weight_decay=0.01)
+    optimizer = get_optimizer(model, learning_rate=1e-4, weight_decay=0.1)
     scheduler = LearningRateScheduler(optimizer, d_model=64, warmup_steps=400)
 
     # Loss function
@@ -176,8 +201,8 @@ def train():
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            logits = outputs.logits
+            outputs = model(src=input_ids, tgt=labels, src_mask=attention_mask)
+            logits = outputs
             loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             loss.backward()
             optimizer.step()
@@ -196,8 +221,8 @@ def train():
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                logits = outputs.logits
+                outputs = model(src=input_ids, tgt=labels, src_mask=attention_mask)
+                logits = outputs
                 loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
                 val_loss += loss.item()
 
@@ -205,6 +230,12 @@ def train():
 
         print(f"Epoch {epoch + 1}: Train Loss = {train_loss:.4f}, Validation Loss = {val_loss:.4f}")
 
+    return model
+
 
 if __name__ == "__main__":
-    train()
+    trained_model = train()
+
+    # Save the trained model weights outside the training function
+    torch.save(trained_model.state_dict(), "trained_transformer_model.pth")
+    print("Model weights saved to 'trained_transformer_model.pth'")

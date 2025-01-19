@@ -1,6 +1,9 @@
 import re
 from datasets import load_dataset
-
+import torch
+import torch.nn as nn
+import math
+import evaluate
 ds = load_dataset("wmt/wmt17", "de-en")
 
 def clean_sentence(sentence):
@@ -85,11 +88,6 @@ class TranslationDataset(Dataset):
         return source_encoded['input_ids'].squeeze(), target_encoded['input_ids'].squeeze()
 
 
-import torch
-import torch.nn as nn
-import math
-
-
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super(PositionalEncoding, self).__init__()
@@ -118,3 +116,10 @@ class WordEmbedding(nn.Module):
 
     def forward(self, x):
         return self.embedding(x)
+
+def BleuMetric(predictions, references):
+    bleu = evaluate.load("bleu")
+
+    # Compute BLEU score
+    results = bleu.compute(predictions=predictions, references=references)
+    print("BLEU score:", results["bleu"])

@@ -1,26 +1,9 @@
-# Model ops from https://github.com/jaymody/picoGPT/blob/main/gpt2.py (MIT license)
 import math
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-
-def softmax(x):
-    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-    return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
-
-
-# [m, in], [in, out], [out] -> [m, out]
-def linear(x, w, b):
-    return x @ w + b
-
-
-# [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
-def attention(q, k, v, mask):
-    return softmax(q @ k.T / np.sqrt(q.shape[-1]) + mask) @ v
-
 
 class Attention:
     def __init__(self, mask_future=True):
@@ -150,22 +133,22 @@ class MultiHeadAttention(nn.Module):
         # Scaled dot-product attention
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [batch_size, num_heads, query_len, key_len]
 
-        # Apply future (causal) mask if specified and if q and k have the same sequence length (self-attention)
-        if self.mask_future and q.size(-2) == k.size(-2):
-            seq_len = attn_scores.size(-1)
-            causal_mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).to(attn_scores.device)
-            attn_scores = attn_scores.masked_fill(causal_mask == 1, float('-inf'))
+        # Stabilize attention scores
+        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True)[0]
 
-        # Apply provided mask if available
+        # Apply future (causal) mask if specified and if q and k have the same sequence length (self-attention)
         if mask is not None:
             if mask.dim() == 2:  # Mask is [batch_size, key_len] (for encoder-decoder cross-attention)
                 mask = mask.unsqueeze(1).unsqueeze(1)  # Reshape to [batch_size, 1, 1, key_len]
             elif mask.dim() == 3:  # Mask is [batch_size, query_len, key_len]
                 mask = mask.unsqueeze(1)  # Reshape to [batch_size, 1, query_len, key_len]
-            attn_scores = attn_scores.masked_fill(mask == 0, float('-inf'))
+            attn_scores = attn_scores.masked_fill(mask == 0, float(-1e9))
 
         # Apply softmax to get attention weights
         attn_weights = F.softmax(attn_scores, dim=-1)
+
+        if torch.isnan(attn_weights).any():
+            raise ValueError("NaN detected in attention weights!")
 
         # Compute output by weighted sum of values
         output = torch.matmul(attn_weights, v)  # [batch_size, num_heads, query_len, d_k]
@@ -178,162 +161,49 @@ class MultiHeadAttention(nn.Module):
 
         return output
 
+def create_padding_mask(seq, pad_token_id):
+    """
+    Create a mask for padding tokens in the sequence.
 
-# [n_seq, n_embd] -> [n_seq, n_embd]
-def causal_self_attention(x, c_attn, c_proj):
-    # qkv projections
-    x = linear(x, **c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
+    Args:
+    - seq (torch.Tensor): Input sequence tensor [batch_size, seq_len].
+    - pad_token_id (int): Padding token ID in the vocabulary.
 
-    # split into qkv
-    q, k, v = np.split(x, 3, axis=-1)  # [n_seq, 3*n_embd] -> 3 of [n_seq, n_embd]
+    Returns:
+    - mask (torch.Tensor): Padding mask [batch_size, 1, 1, seq_len].
+    """
+    # Mask positions where the value is equal to `pad_token_id`
+    mask = (seq == pad_token_id).unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
+    return mask
 
-    # causal mask to hide future inputs from being attended to
-    causal_mask = (1 - np.tri(x.shape[0], dtype=x.dtype)) * -1e10  # [n_seq, n_seq]
+def test_padding_mask():
+    """
+    Test function to verify if masked padding correctly identifies and masks padding tokens.
+    """
+    # Example sequence batch with padding tokens (e.g., 0 is the pad_token_id)
+    seq = torch.tensor([
+        [1, 2, 3, 0, 0],  # Padding at the end
+        [4, 5, 0, 0, 0],  # More padding
+        [6, 7, 8, 9, 10]  # No padding
+    ])  # Shape: [batch_size, seq_len]
 
-    # perform causal self attention
-    x = attention(q, k, v, causal_mask)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    pad_token_id = 0  # Define the padding token ID
 
-    # out projection
-    x = linear(x, **c_proj)  # [n_seq, n_embd] @ [n_embd, n_embd] = [n_seq, n_embd]
+    # Create the padding mask
+    mask = (seq == pad_token_id).unsqueeze(1).unsqueeze(2).float()  # Shape: [batch_size, 1, 1, seq_len]
 
-    return x
+    # Example attention scores (random values for testing)
+    attention_scores = torch.rand(seq.size(0), 1, seq.size(1), seq.size(1))  # Shape: [batch_size, num_heads, query_len, key_len]
 
+    # Apply the mask to attention scores
+    masked_attention_scores = attention_scores.masked_fill(mask == 1, float('-inf'))
 
-# [n_seq, n_embd] -> [n_seq, n_embd]
-def transformer_block(x, attn):
-    x = x + causal_self_attention(x, **attn)
-    # NOTE: removed ffn
-    return x
-
-
-# [n_seq] -> [n_seq, n_vocab]
-def gpt(inputs, wte, wpe, blocks):
-    # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
-
-    # forward pass through n_layer transformer blocks
-    for block in blocks:
-        x = transformer_block(x, **block)  # [n_seq, n_embd] -> [n_seq, n_embd]
-
-    # projection to vocab
-    return x @ wte.T  # [n_seq, n_embd] -> [n_seq, n_vocab]
-
-
-N_CTX = 5
-N_VOCAB = 2
-N_EMBED = 8
-
-Lg = 1024  # Large
-
-MODEL = {
-    # EMBEDDING USAGE
-    #  P = Position embeddings (one-hot)
-    #  T = Token embeddings (one-hot, first is `a`, second is `b`)
-    #  V = Prediction scratch space
-    #
-    #       [P, P, P, P, P, T, T, V]
-    "wte": np.array(
-        # one-hot token embeddings
-        [
-            [0, 0, 0, 0, 0, 1, 0, 0],  # token `a` (id 0)
-            [0, 0, 0, 0, 0, 0, 1, 0],  # token `b` (id 1)
-        ]
-    ),
-    "wpe": np.array(
-        # one-hot position embeddings
-        [
-            [1, 0, 0, 0, 0, 0, 0, 0],  # position 0
-            [0, 1, 0, 0, 0, 0, 0, 0],  # position 1
-            [0, 0, 1, 0, 0, 0, 0, 0],  # position 2
-            [0, 0, 0, 1, 0, 0, 0, 0],  # position 3
-            [0, 0, 0, 0, 1, 0, 0, 0],  # position 4
-        ]
-    ),
-    "blocks": [
-        {
-            "attn": {
-                "c_attn": {  # generates qkv matrix
-                    "b": np.zeros(N_EMBED * 3),
-                    "w": np.array(
-                        # this is where the magic happens
-                        # fmt: off
-                        [
-                            [Lg, 0., 0., 0., 0., 0., 0., 0.,  # q
-                             1., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [Lg, Lg, 0., 0., 0., 0., 0., 0.,  # q
-                             0., 1., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., Lg, Lg, 0., 0., 0., 0., 0.,  # q
-                             0., 0., 1., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., 0., Lg, Lg, 0., 0., 0., 0.,  # q
-                             0., 0., 0., 1., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., 0., 0., Lg, Lg, 0., 0., 0.,  # q
-                             0., 0., 0., 0., 1., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                            [0., 0., 0., 0., 0., 0., 0., 0.,  # q
-                             0., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 1.],  # v
-                            [0., 0., 0., 0., 0., 0., 0., 0.,  # q
-                             0., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., -1],  # v
-                            [0., 0., 0., 0., 0., 0., 0., 0.,  # q
-                             0., 0., 0., 0., 0., 0., 0., 0.,  # k
-                             0., 0., 0., 0., 0., 0., 0., 0.],  # v
-                        ]
-                        # fmt: on
-                    ),
-                },
-                "c_proj": {  # weights to project attn result back to embedding space
-                    "b": [0, 0, 0, 0, 0, Lg, 0, 0],
-                    "w": np.array(
-                        [
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, 0, 0, 0],
-                            [0, 0, 0, 0, 0, -Lg, Lg, 0],
-                        ]
-                    ),
-                },
-            },
-        }
-    ],
-}
-
-CHARS = ["a", "b"]
-
-
-def tokenize(s): return [CHARS.index(c) for c in s]
-
-
-def untok(tok): return CHARS[tok]
-
-
-def predict(s):
-    tokens = tokenize(s)[-5:]
-    logits = gpt(np.array(tokens), **MODEL)
-    probs = softmax(logits)
-
-    for i, tok in enumerate(tokens):
-        pred = np.argmax(probs[i])
-        print(
-            f"{untok(tok)} ({tok}): next={untok(pred)} ({pred}) probs={probs[i]} logits={logits[i]}"
-        )
-
-    return np.argmax(probs[-1])
-
-
-def complete(s, max_new_tokens=10):
-    tokens = tokenize(s)
-    while len(tokens) < len(s) + max_new_tokens:
-        logits = gpt(np.array(tokens[-5:]), **MODEL)
-        probs = softmax(logits)
-        pred = np.argmax(probs[-1])
-        tokens.append(pred)
-    return s + " :: " + "".join(untok(t) for t in tokens[len(s):])
+    # Print results
+    print("Input Sequence:")
+    print(seq)
+    print("\nGenerated Mask:")
+    print(mask)
+    print("\nAttention Scores Before Masking:")
+    print(attention_scores)
+    print("\nAttention Scores After Masking:")
+    print(masked_attention_scores)
