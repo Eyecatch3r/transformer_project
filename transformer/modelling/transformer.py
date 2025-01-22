@@ -4,7 +4,7 @@ from datasets import load_dataset
 from tokenizers.implementations import CharBPETokenizer
 from transformers import AutoTokenizer
 from transformers.models.cvt.convert_cvt_original_pytorch_checkpoint_to_pytorch import attention
-
+import torch.nn.functional as F
 from modelling.functional import BaseTransformerLayer, TransformerDecoderLayer
 from modelling.positional_encoding import PositionalEncoding
 import math
@@ -96,7 +96,8 @@ class TransformerModel(nn.Module):
         with torch.no_grad():
             self.embedding.weight[:old_vocab_size] = old_embeddings.weight
 
-        # Adjust the output layer (if weight tying is used)
+        # Retie the output layer weights (if weight tying is used)
+        self.output_layer = nn.Linear(embedding_dim, new_vocab_size, bias=False)
         self.output_layer.weight = self.embedding.weight
 
 
@@ -163,13 +164,13 @@ def autoregressive_generate(
 
         logits = (output[:, -1])
         logits = logits / temperature  # Apply temperature scaling
-        probs = torch.softmax(logits, dim=-1)
 
-        # Apply top-k sampling
-        top_k_probs, top_k_indices = torch.topk(probs, k=top_k, dim=-1)
+        # Greedy decoding: select token with highest probability
+        probs = F.softmax(logits, dim=-1)
+        next_token_id = torch.argmax(probs, dim=-1).item()
 
-        # Select the next token for batch_size = 1
-        next_token_id = top_k_indices[0, torch.argmax(top_k_probs)].item()
+        # Append the selected token to the sequence
+        ys = torch.cat([ys, torch.tensor([[next_token_id]], device=device)], dim=1)
 
         if next_token_id == end_token_id:
             break
@@ -183,9 +184,14 @@ def autoregressive_generate(
     return generated_text
 
 if __name__ == "__main__":
+    # Load dataset and tokenizer
     dataset = load_dataset("wmt/wmt17", "de-en")
     tokenizer = AutoTokenizer.from_pretrained("t5-small")
-    torch.device("cuda")
+
+    # Add special tokens to tokenizer
+    tokenizer.add_special_tokens({"bos_token": "<start>", "eos_token": "<end>"})
+
+    # Initialize model
     model = TransformerModel(
         vocab_size=tokenizer.vocab_size,
         d_model=64,
@@ -195,28 +201,35 @@ if __name__ == "__main__":
         dim_feedforward=128,
         dropout=0.1,
         max_len=128,
-
     )
 
-    model.apply(init_weights)
+    # Resize model embeddings to account for special tokens
+    model.resize_token_embeddings(len(tokenizer))
+
+    # Load trained weights
     model.load_state_dict(torch.load("../training/trained_transformer_model.pth"))
 
+    # Prepare sample input
     sample = dataset["test"][0]["translation"]["de"]
-    tokenized = tokenizer(sample, return_tensors="pt", truncation=True, padding=True)
+    input_text = f"{tokenizer.bos_token} {sample} {tokenizer.eos_token}"
+    tokenized = tokenizer(input_text, return_tensors="pt", truncation=True, padding=True)
 
-    # Keep src_tokens as a tensor and move it to the correct device
+
+    # Move input to device
     src_tokens = tokenized["input_ids"].squeeze().tolist()
     attention_mask = tokenized["attention_mask"].to("cuda")
 
+    # Generate translation
     translation = autoregressive_generate(
         model,
         src_tokens,
         tokenizer,
         max_len=50,
-        start_token=tokenizer.pad_token,
+        start_token=tokenizer.bos_token,
         end_token=tokenizer.eos_token,
-        attention_mask=attention_mask
+        attention_mask=attention_mask,
     )
 
     print("Source:", sample)
     print("Generated Translation:", translation)
+

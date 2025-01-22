@@ -50,8 +50,8 @@ def test_lrs():
     # Beispiel-Parameter
     d_model = 512  # Modellgröße
     warmup_steps = 4000  # Warmup-Schritte
-    model = torch.nn.Linear(10, 10)  # Beispielmodell
-    optimizer = optim.Adam(model.parameters(), lr=0.0)  # Start-LR wird vom Scheduler gesetzt
+    model = torch.nn.Linear(10, 10)
+    optimizer = optim.Adam(model.parameters(), lr=0.0)
 
     # Scheduler initialisieren
     scheduler = LearningRateScheduler(optimizer, d_model, warmup_steps)
@@ -125,19 +125,37 @@ def test_AdamW():
     print(optimizer)
 
 
-def preprocess_split_and_collate(dataset, tokenizer):
-    def preprocess(examples):
-        # Handle 'translation' as a list of dictionaries
-        translations = examples.get("translation", [])
-        inputs = [entry["de"] for entry in translations if "de" in entry]
-        targets = [entry["en"] for entry in translations if "en" in entry]
+def preprocess_with_special_tokens(dataset, tokenizer, max_length=128):
+    """
+    Preprocess the dataset by tokenizing and baking in special tokens.
 
-        # Tokenize inputs and targets
+    Args:
+    - dataset: The dataset to preprocess.
+    - tokenizer: The tokenizer to use.
+    - max_length (int): Maximum sequence length for padding and truncation.
+
+    Returns:
+    - Preprocessed dataset with baked-in special tokens.
+    """
+    def process_example(example):
+        # Add special tokens to the target translations
+        example["translation"]["en"] = f"{tokenizer.bos_token} {example['translation']['en']} {tokenizer.eos_token}"
+        return example
+
+    # Map the process_example function over the dataset
+    dataset = dataset.map(process_example)
+
+    # Tokenize inputs and targets
+    def tokenize_batch(batch):
+        inputs = [ex["de"] for ex in batch["translation"]]
+        targets = [ex["en"] for ex in batch["translation"]]
+
+        # Tokenize the inputs and targets
         tokenized_inputs = tokenizer(
-            inputs, max_length=128, truncation=True, padding="max_length", return_tensors="pt"
+            inputs, max_length=max_length, truncation=True, padding="max_length", return_tensors="pt"
         )
         tokenized_targets = tokenizer(
-            targets, max_length=128, truncation=True, padding="max_length", return_tensors="pt"
+            targets, max_length=max_length, truncation=True, padding="max_length", return_tensors="pt"
         )
 
         return {
@@ -146,32 +164,29 @@ def preprocess_split_and_collate(dataset, tokenizer):
             "labels": tokenized_targets["input_ids"],
         }
 
-    # Reduce dataset size for faster testing
-    small_train = dataset["train"].shuffle(seed=42).select(range(3000))
-    small_val = dataset["validation"].shuffle(seed=42).select(range(2999))
+    # Apply the tokenization
+    dataset = dataset.map(tokenize_batch, batched=True, remove_columns=["translation"])
 
-    # Apply preprocessing
-    small_train = small_train.map(preprocess, batched=True, remove_columns=["translation"] )
-    small_val = small_val.map(preprocess, batched=True, remove_columns=["translation"] )
+    return dataset
 
-    # Data collator
-    data_collator = DataCollatorForSeq2Seq(tokenizer, model=None)
-
-    # Data loaders
-    train_dataloader = DataLoader(small_train, batch_size=16, collate_fn=data_collator)
-    val_dataloader = DataLoader(small_val, batch_size=16, collate_fn=data_collator)
-    return train_dataloader, val_dataloader
 
 
 def train():
-    # Load dataset
+    # Load dataset and tokenizer
     dataset = load_dataset("wmt/wmt17", "de-en")
-    tokenizer = AutoTokenizer.from_pretrained("t5-small")
-    assert torch.cuda.is_available()
-    # Preprocess and split dataset
-    train_dataloader, val_dataloader = preprocess_split_and_collate(dataset, tokenizer)
 
-    # Model, optimizer, scheduler
+    # Reduce size for testing
+    train_dataset = dataset["train"].shuffle(seed=32).select(range(100000))  # 3,000 samples
+    val_dataset = dataset["validation"]
+
+    # Load and update tokenizer
+    tokenizer = AutoTokenizer.from_pretrained("t5-small")
+    tokenizer.add_special_tokens({"bos_token": "<start>", "eos_token": "<end>"})
+
+    print(f"Tokenizer vocab size: {len(tokenizer)}")
+    print(f"Special tokens added: BOS={tokenizer.bos_token}, EOS={tokenizer.eos_token}")
+
+    # Initialize model and resize embeddings
     model = TransformerModel(
         vocab_size=tokenizer.vocab_size,
         d_model=64,
@@ -179,20 +194,41 @@ def train():
         num_encoder_layers=4,
         num_decoder_layers=4,
         dim_feedforward=128,
-        dropout=0.3,
+        dropout=0.1,
         max_len=128,
     )
+    model.resize_token_embeddings(len(tokenizer))
+    print(f"Model embedding size after resizing: {model.embedding.weight.size()}")
+
+    # Preprocess datasets with resized tokenizer
+    train_dataset = preprocess_with_special_tokens(train_dataset, tokenizer)
+    val_dataset = preprocess_with_special_tokens(val_dataset, tokenizer)
+
+    # Debug: Print a sample preprocessed data entry
+    print(f"Sample preprocessed train data: {train_dataset[0]}")
+
+    # Data collator and DataLoaders
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=None)
+    train_dataloader = DataLoader(train_dataset, batch_size=16, collate_fn=data_collator)
+    val_dataloader = DataLoader(val_dataset, batch_size=16, collate_fn=data_collator)
+
+    # Optimizer, scheduler, and criterion
     optimizer = get_optimizer(model, learning_rate=1e-4, weight_decay=0.1)
     scheduler = LearningRateScheduler(optimizer, d_model=64, warmup_steps=400)
-
-    # Loss function
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
-    # Training loop
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    best_val_loss = float('inf')
+    patience = 5
+    no_improve_epochs = 0
+    min_delta = 0.001  # Minimum change in validation loss
+
     for epoch in range(5):
+        print(f"Starting epoch {epoch + 1}...")
+
+        # Training loop
         model.train()
         train_loss = 0
         for batch in train_dataloader:
@@ -201,16 +237,21 @@ def train():
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
-            outputs = model(src=input_ids, tgt=labels, src_mask=attention_mask)
+            # Model forward pass
+            outputs = model(src=input_ids, tgt=labels, src_mask=attention_mask, tgt_mask=None)
             logits = outputs
+
+            # Compute loss and backpropagate
             loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
 
             train_loss += loss.item()
 
         train_loss /= len(train_dataloader)
+        print(f"Epoch {epoch + 1}: Train Loss = {train_loss:.4f}")
 
         # Validation loop
         model.eval()
@@ -221,16 +262,29 @@ def train():
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
 
-                outputs = model(src=input_ids, tgt=labels, src_mask=attention_mask)
+                outputs = model(src=input_ids, tgt=labels, src_mask=attention_mask, tgt_mask=None)
                 logits = outputs
                 loss = criterion(logits.view(-1, logits.size(-1)), labels.view(-1))
                 val_loss += loss.item()
 
         val_loss /= len(val_dataloader)
+        print(f"Epoch {epoch + 1}: Validation Loss = {val_loss:.4f}")
 
-        print(f"Epoch {epoch + 1}: Train Loss = {train_loss:.4f}, Validation Loss = {val_loss:.4f}")
+        # Early Stopping Check
+        if val_loss < best_val_loss - min_delta:
+            best_val_loss = val_loss
+            no_improve_epochs = 0
+            # Save the model
+            torch.save(model.state_dict(), "best_transformer_model.pth")
+            print("Model saved!")
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
 
     return model
+
 
 
 if __name__ == "__main__":
