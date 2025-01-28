@@ -106,60 +106,39 @@ class MultiHeadAttention(nn.Module):
         return x.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
 
     def forward(self, q, k, v, mask=None):
-        """
-        Apply the multi-head attention mechanism.
-
-        Args:
-        - q (torch.Tensor): Query matrix [batch_size, query_len, d_model]
-        - k (torch.Tensor): Key matrix [batch_size, key_len, d_model]
-        - v (torch.Tensor): Value matrix [batch_size, key_len, d_model]
-        - mask (torch.Tensor, optional): Attention mask [batch_size, query_len, key_len]
-
-        Returns:
-        - torch.Tensor: Multi-head attention output [batch_size, query_len, d_model]
-        """
         batch_size = q.size(0)
 
-        # Linear projections for query, key, and value
-        q = self.query_transform(q)
-        k = self.key_transform(k)
-        v = self.value_transform(v)
-
-        # Split into multiple heads
-        q = self.split_heads(q, batch_size)  # [batch_size, num_heads, query_len, d_k]
-        k = self.split_heads(k, batch_size)  # [batch_size, num_heads, key_len, d_k]
-        v = self.split_heads(v, batch_size)  # [batch_size, num_heads, key_len, d_k]
+        # Linear projections
+        q = self.split_heads(self.query_transform(q), batch_size)
+        k = self.split_heads(self.key_transform(k), batch_size)
+        v = self.split_heads(self.value_transform(v), batch_size)
 
         # Scaled dot-product attention
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)  # [batch_size, num_heads, query_len, key_len]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
 
-        # Stabilize attention scores
-        attn_scores = attn_scores - attn_scores.max(dim=-1, keepdim=True)[0]
+        # Apply causal mask if needed
+        if self.mask_future:
+            seq_len_q, seq_len_k = attn_scores.size(-2), attn_scores.size(-1)
+            causal_mask = torch.triu(torch.ones(seq_len_q, seq_len_k), diagonal=1).to(attn_scores.device)
+            attn_scores = attn_scores.masked_fill(causal_mask == 1, float(-1e9))
 
-        # Apply future (causal) mask if specified and if q and k have the same sequence length (self-attention)
         if mask is not None:
-            if mask.dim() == 2:  # Mask is [batch_size, key_len] (for encoder-decoder cross-attention)
-                mask = mask.unsqueeze(1).unsqueeze(1)  # Reshape to [batch_size, 1, 1, key_len]
-            elif mask.dim() == 3:  # Mask is [batch_size, query_len, key_len]
-                mask = mask.unsqueeze(1)  # Reshape to [batch_size, 1, query_len, key_len]
+            # Ensure mask has at least 4 dimensions [batch_size, num_heads, query_len, key_len]
+            while mask.dim() < 4:
+                mask = mask.unsqueeze(1)
+            # Align mask with attention scores
+            mask = mask.expand(attn_scores.size(0), attn_scores.size(1), attn_scores.size(2), attn_scores.size(3))
+
+            # Apply the mask
             attn_scores = attn_scores.masked_fill(mask == 0, float(-1e9))
 
-        # Apply softmax to get attention weights
+        # Softmax and attention weights
         attn_weights = F.softmax(attn_scores, dim=-1)
+        output = torch.matmul(attn_weights, v)
 
-        if torch.isnan(attn_weights).any():
-            raise ValueError("NaN detected in attention weights!")
-
-        # Compute output by weighted sum of values
-        output = torch.matmul(attn_weights, v)  # [batch_size, num_heads, query_len, d_k]
-
-        # Concatenate heads and reshape back to [batch_size, query_len, d_model]
+        # Combine heads and final transformation
         output = self.combine_heads(output, batch_size)
-
-        # Final linear transformation
-        output = self.output_transform(output)
-
-        return output
+        return self.output_transform(output)
 
 def create_padding_mask(seq, pad_token_id):
     """

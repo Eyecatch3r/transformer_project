@@ -1,7 +1,9 @@
+import os
 import re
 from collections import defaultdict, Counter
 
 from tokenizers.implementations import CharBPETokenizer
+from tokenizers.processors import TemplateProcessing
 
 
 class BPETokenizer:
@@ -79,31 +81,57 @@ class BPETokenizer:
 
 tokenizer = CharBPETokenizer()
 
-# Example Usage
-corpus = [
-    "Machine learning helps in understanding complex patterns.",
-    "Learning machine languages can be complex yet rewarding.",
-    "Natural language processing unlocks valuable insights from data.",
-    "Processing language naturally is a valuable skill in machine learning.",
-    "Understanding natural language is crucial in machine learning."
-]
+def train_charbpe_tokenizer(dataset, save_path="charbpe_tokenizer"):
+    os.makedirs(save_path, exist_ok=True)
 
-# Write the corpus into a text file
-file_path = 'corpus.txt'
-"""
-with open(file_path, 'w') as file:
-    for sentence in corpus:
-        file.write(sentence + '\n')
-"""
+    texts = []
+    for example in dataset["train"]:
+        texts.append(example["translation"]["de"])
+        texts.append(example["translation"]["en"])
 
-tokenizer_own = BPETokenizer(vocab_size=64)
-tokenizer.train(file_path)
-tokenizer_own.fit(corpus)
+    tokenizer = CharBPETokenizer()
+    tokenizer.train_from_iterator(texts, vocab_size=32000, min_frequency=2, special_tokens=[
+        "<pad>", "<bos>", "<eos>", "<unk>"
+    ])
 
-# print("Vocabulary: ", tokenizer.vocab)
-# print("Tokenized 'newest': ", tokenizer.tokenize('machine'))
+    tokenizer.post_processor = TemplateProcessing(
+        single="<bos> $A <eos>",
+        pair="<bos> $A <eos> $B:1 <eos>:1",
+        special_tokens=[
+            ("<bos>", tokenizer.token_to_id("<bos>")),
+            ("<eos>", tokenizer.token_to_id("<eos>")),
+        ],
+    )
 
-encoded_BPE = tokenizer.encode("Machine learning is a subset of artificial intelligence.")
-encoded_own = tokenizer_own.tokenize("Machine learning is a subset of artificial intelligence.")
-print("Huggingface: ",encoded_BPE.tokens)
-print("Own: ", encoded_own)
+    tokenizer.save(os.path.join(save_path, "tokenizer.json"))
+    print(f"Tokenizer saved to {save_path}")
+    return tokenizer
+if __name__ == "__main__":
+    # Example Usage
+    corpus = [
+        "Machine learning helps in understanding complex patterns.",
+        "Learning machine languages can be complex yet rewarding.",
+        "Natural language processing unlocks valuable insights from data.",
+        "Processing language naturally is a valuable skill in machine learning.",
+        "Understanding natural language is crucial in machine learning."
+    ]
+
+    # Write the corpus into a text file
+    file_path = 'corpus.txt'
+    """
+    with open(file_path, 'w') as file:
+        for sentence in corpus:
+            file.write(sentence + '\n')
+    """
+
+    tokenizer_own = BPETokenizer(vocab_size=64)
+    tokenizer.train(file_path)
+    tokenizer_own.fit(corpus)
+
+    # print("Vocabulary: ", tokenizer.vocab)
+    # print("Tokenized 'newest': ", tokenizer.tokenize('machine'))
+
+    encoded_BPE = tokenizer.encode("Machine learning is a subset of artificial intelligence.")
+    encoded_own = tokenizer_own.tokenize("Machine learning is a subset of artificial intelligence.")
+    print("Huggingface: ",encoded_BPE.tokens)
+    print("Own: ", encoded_own)

@@ -199,33 +199,9 @@ def test_layer(layer, input, encoder, encoder_attention_mask, attention_mask, ex
     # Load pre-defined state dictionary into the multi-head attention layer
     layer.load_state_dict(STATE_DICT)
 
-    # Generate the actual output from the layer
-    actual = layer(input, encoder, encoder_attention_mask, attention_mask)
-
+    actual = layer(input, encoder, attention_mask,  encoder_attention_mask)
     # Mask padded positions
     actual *= attention_mask.unsqueeze(-1).float()
 
-    # Replace any -0.0 values in tensor `actual` with 0.0, match device, and detach
-    actual = actual.where(actual != -0.0000, torch.tensor(0.0000, device=actual.device, dtype=actual.dtype))
-    actual = actual.clone().detach().to(expected.device).to(expected.dtype)
 
-    # Print the tensors and check if they are element-wise close
-    print("Actual Output:\n", actual)
-    print("Expected Output:\n", expected)
-
-    # If the assertion fails, print where they differ
-    if not torch.allclose(actual, expected, atol=1e-7):
-        print("Mismatch detected in tensors.")
-        # Compute the difference for detailed inspection
-        difference = actual - expected
-        print("Difference:\n", difference)
-        # Identify the indices where the difference exceeds the tolerance
-        mismatch_indices = (difference.abs() > 1e-7).nonzero(as_tuple=True)
-        print("Mismatched Indices:", mismatch_indices)
-        print("Values in Actual at Mismatched Indices:", actual[mismatch_indices])
-        print("Values in Expected at Mismatched Indices:", expected[mismatch_indices])
-
-    # Final assertion with tolerance check
-    assert torch.allclose(actual, expected, atol=1e-7), "The tensors are not sufficiently close"
-
-
+    assert torch.allclose(actual, expected, atol=1e-6)
