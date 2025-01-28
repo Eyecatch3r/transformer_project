@@ -1,3 +1,5 @@
+import random
+
 import torch
 import torch.nn as nn
 from datasets import load_dataset
@@ -182,7 +184,7 @@ def autoregressive_generate(
         tgt_mask = torch.triu(torch.ones(1, num_heads, seq_len, 128, device=device), diagonal=1).bool()
         output = tgt_emb
         for layer in model.decoder_layers:
-            output = layer(output, memory, self_attn_mask=tgt_mask)
+            output = layer(output, memory, cross_attn_mask=tgt_mask)
 
         logits = (output[:, -1])
         probs = F.softmax(logits, dim=-1)
@@ -206,33 +208,41 @@ if __name__ == "__main__":
     # Load tokenizer
     tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
+    # Initialize the model
     model = TransformerModel(
         vocab_size=tokenizer.vocab_size,
-        d_model=64,  # Increase model size
+        d_model=64,  # Model size
         n_heads=4,
-        num_encoder_layers=6,  # Increase depth
-        num_decoder_layers=6,
-        dim_feedforward=128,  # Increase feedforward dimension
+        num_encoder_layers=4,  # Encoder layers
+        num_decoder_layers=4,  # Decoder layers
+        dim_feedforward=128,  # Feedforward dimension
         dropout=0.2,
         max_len=128,
     )
     model.load_state_dict(torch.load("../training/best_transformer_model.pth"))
+    model.eval()
 
-    # Sample input
-    src_text = "28-jähriger Koch in San Francisco Mall tot aufgefunden"
+    # Load dataset
+    dataset = load_dataset("wmt16", "de-en")["train"]  # Adjust dataset as needed
 
-    # Generate translation
-    translation = autoregressive_generate(
-        model,
-        src_text,
-        tokenizer,
-        max_len=50,
-        start_token="<s>",
-        end_token="</s>",
-    )
+    # Select 10 random sentences
+    random_indices = random.sample(range(len(dataset)), 10)
+    random_sentences = [dataset[idx]["translation"]["de"] for idx in random_indices]
 
-    print("Source:", src_text)
-    print("Generated Translation:", translation)
+    # Translate each sentence
+    for i, src_text in enumerate(random_sentences, 1):
+        translation = autoregressive_generate(
+            model,
+            src_text,
+            tokenizer,
+            max_len=50,
+            start_token="<s>",
+            end_token="</s>",
+        )
+        print(f"Sentence {i}:")
+        print(f"  Source: {src_text}")
+        print(f"  Translation: {translation}")
+        print()
 
 
 

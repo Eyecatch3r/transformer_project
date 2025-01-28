@@ -123,13 +123,27 @@ class MultiHeadAttention(nn.Module):
             attn_scores = attn_scores.masked_fill(causal_mask == 1, float(-1e9))
 
         if mask is not None:
-            # Ensure mask has at least 4 dimensions [batch_size, num_heads, query_len, key_len]
-            while mask.dim() < 4:
-                mask = mask.unsqueeze(1)
-            # Align mask with attention scores
-            mask = mask.expand(attn_scores.size(0), attn_scores.size(1), attn_scores.size(2), attn_scores.size(3))
+            # Ensure mask has correct dimensions: [batch_size, num_heads, query_len, key_len]
+            if mask.dim() == 2:  # Mask is [batch_size, key_len]
+                mask = mask.unsqueeze(1).unsqueeze(2)  # Shape: [batch_size, 1, 1, key_len]
+            elif mask.dim() == 3:  # Mask is [batch_size, query_len, key_len]
+                mask = mask.unsqueeze(1)  # Shape: [batch_size, 1, query_len, key_len]
 
-            # Apply the mask
+            # Expand mask to match attention scores' dimensions
+            query_len = attn_scores.size(-2)
+            key_len = attn_scores.size(-1)
+            batch_size, num_heads = attn_scores.size(0), attn_scores.size(1)
+
+            # Align mask dimensions
+            mask = mask.expand(batch_size, num_heads, query_len, key_len)
+
+            # Debug shape alignment
+            if mask.size() != attn_scores.size():
+                raise ValueError(
+                    f"Mask and attention scores size mismatch: mask={mask.size()}, attn_scores={attn_scores.size()}"
+                )
+
+            # Apply mask
             attn_scores = attn_scores.masked_fill(mask == 0, float(-1e9))
 
         # Softmax and attention weights

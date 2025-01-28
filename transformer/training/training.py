@@ -156,7 +156,7 @@ def preprocess_with_t5_tokenizer(dataset, tokenizer, max_length=128):
 def train():
     # Load dataset
     dataset = load_dataset("wmt/wmt17", "de-en")
-    train_dataset = dataset["train"].shuffle(seed=42).select(range(20000))  # Subset for faster training
+    train_dataset = dataset["train"].shuffle(seed=42).select(range(300000))  # Subset for faster training
     val_dataset = dataset["validation"].shuffle(seed=42)
 
     # Load T5Tokenizer
